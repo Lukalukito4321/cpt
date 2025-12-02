@@ -1,6 +1,6 @@
 // cpt.js - Capture watcher + HIT stats + small web server
-// 1) შეცვალე ქვემოთ მითითებული DISCORD_TOKEN / CHANNEL_ID / LOG_PATH
-// 2) გაუშვი:  npm install  &&  npm start
+// 1) Edit TOKEN / CHANNEL_ID / LOG_PATH via environment variables or .env
+// 2) Run:  npm install  &&  npm start
 
 const {
   Client,
@@ -15,37 +15,52 @@ const fs = require("fs");
 const express = require("express");
 const path = require("path");
 
-// ---------- SETTINGS (შეแกვე) ----------
-require("dotenv").config();   // load .env
+// ---------- SETTINGS ----------
+let dotenvLoaded = false;
+try {
+  // Will silently do nothing if .env doesn't exist (Railway is fine)
+  require("dotenv").config();
+  dotenvLoaded = true;
+} catch (e) {
+  console.log("dotenv not found – this is fine if you use real env vars (e.g. Railway).");
+}
 
-const DISCORD_TOKEN = process.env.TOKEN;  // .env: TOKEN=your_token_here
-const CHANNEL_ID = "1441330193883987999"; // აქ ჩასვი არხის ID
-const LOG_PATH = "C:\\Users\\viado\\PyCharmMiscProject\\capture\\server.log";  // server.log-ის გზა
+// BOT TOKEN (MUST be set)
+const DISCORD_TOKEN = process.env.TOKEN || "";
+if (!DISCORD_TOKEN) {
+  console.error("❌ No TOKEN environment variable found. Set TOKEN in .env or Railway variables.");
+  process.exit(1);
+}
 
-// create Discord client (ONLY ONCE)
+// DISCORD CHANNEL
+const CHANNEL_ID = process.env.CHANNEL_ID || "1441330193883987999"; // change or move to env if you like
+
+// LOG PATH – override via LOG_PATH env when needed (e.g. Railway)
+const DEFAULT_LOG_PATH = "C:\\Users\\viado\\PyCharmMiscProject\\capture\\server.log";
+const LOG_PATH = process.env.LOG_PATH || DEFAULT_LOG_PATH;
+
+// Web server port
+const WEB_PORT = process.env.PORT ? Number(process.env.PORT) : 3000;
+
+// ---------- DISCORD CLIENT ----------
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent,
-  ],
+    GatewayIntentBits.MessageContent
+  ]
 });
 
-const WEB_PORT = 3000;                                      // ვებ-პორტი (http://localhost:3000)
-// --------------------------------------
-
-// Static files (public/index.html, style.css, script.js, a.webp, generated *.html)
+// ---------- STATIC FILES ----------
 const WEB_DIR = path.join(__dirname, "public");
 if (!fs.existsSync(WEB_DIR)) {
   fs.mkdirSync(WEB_DIR, { recursive: true });
 }
 
-// --- Express web server ---
 const app = express();
 app.use(express.static(WEB_DIR));
 
-// In-memory player stats
-// gang keyები არის lower-case: ballas, marabunta, families, vagos, bloods
+// In-memory stats
 let playerStats = {
   ballas: {},
   marabunta: {},
@@ -54,27 +69,34 @@ let playerStats = {
   bloods: {}
 };
 
-// API რომ frontend-მა გამოითხოვოს სტატი
+// Simple stats API for frontend (script.js)
 app.get("/stats", (req, res) => {
   res.json(playerStats);
 });
 
 app.listen(WEB_PORT, () => {
-  console.log(`Web server running at http://localhost:${WEB_PORT}`);
+  console.log(`🌐 Web server running at http://localhost:${WEB_PORT}`);
 });
 
 // Gang colors/emojis
 const gangColors = {
-  "ballas":   { emoji: "🟪", color: 0x800080 },
-  "families": { emoji: "🟢", color: 0x2ECC71 },
-  "marabunta":{ emoji: "🟦", color: 0x3498DB },
-  "bloods":   { emoji: "🩸", color: 0xE74C3C },
-  "vagos":    { emoji: "🟨", color: 0xF1C40F }
+  ballas:   { emoji: "🟪", color: 0x800080 },
+  families: { emoji: "🟢", color: 0x2ECC71 },
+  marabunta:{ emoji: "🟦", color: 0x3498DB },
+  bloods:   { emoji: "🩸", color: 0xE74C3C },
+  vagos:    { emoji: "🟨", color: 0xF1C40F }
 };
 
+// ---------- DISCORD READY + LOG WATCH ----------
 client.once("ready", () => {
-  console.log(`Bot logged in as ${client.user.tag}`);
-  console.log("Watching file:", LOG_PATH);
+  console.log(`🤖 Bot logged in as ${client.user.tag}`);
+
+  if (!fs.existsSync(LOG_PATH)) {
+    console.warn(`⚠ LOG_PATH does not exist: ${LOG_PATH}`);
+    console.warn("   Create the file or set LOG_PATH env var correctly.");
+  } else {
+    console.log("📄 Watching log file:", LOG_PATH);
+  }
 
   chokidar.watch(LOG_PATH, {
     persistent: true,
@@ -86,37 +108,37 @@ client.once("ready", () => {
     }
   })
     .on("change", filePath => {
-      console.log("File changed:", filePath);
+      console.log("🔄 File changed:", filePath);
       readLastLine(LOG_PATH, (line) => {
         if (!line) return;
-        console.log("NEW LINE:", line);
+        console.log("➡ NEW LINE:", line);
         parseLogLine(line);
       });
     })
     .on("error", err => console.error("Watcher error:", err));
 });
 
-// წაიკითხავს ბოლო სტრიქონს
+// ---------- HELPERS ----------
 function readLastLine(filePath, callback) {
   fs.readFile(filePath, "utf8", (err, data) => {
     if (err) {
-      console.error("Read error:", err);
+      console.error("Read error:", err.message);
       return callback(null);
     }
-    const lines = data.trim().split("\n");
+    const trimmed = data.trim();
+    if (!trimmed) return callback(null);
+    const lines = trimmed.split("\n");
     callback(lines[lines.length - 1] || null);
   });
 }
 
 // MAIN log parser
 function parseLogLine(line) {
-  // 1) HIT line
   if (line.includes("[HIT]")) {
     parseHitLine(line);
     return;
   }
 
-  // 2) Capture start line
   if (!line.includes("[CAPTURE]")) return;
 
   const regex = /\[CAPTURE\]\s+gang1=(.*?)\s+gang2=(.*?)\s+start=(.*?)\s+weapon=(.*)$/;
@@ -135,7 +157,7 @@ function parseLogLine(line) {
 }
 
 // HIT line parser
-// ფორმატი: [HIT] gang=Ballas nick=AV_ASSA hits=3 headshots=1 dmg=90
+// Example: [HIT] gang=Ballas nick=AV_ASSA hits=3 headshots=1 dmg=90
 function parseHitLine(line) {
   const hitRegex = /\[HIT\]\s+gang=(.*?)\s+nick=(.*?)\s+hits=(\d+)\s+headshots=(\d+)\s+dmg=(\d+)/;
   const match = line.match(hitRegex);
@@ -147,9 +169,9 @@ function parseHitLine(line) {
   const gangRaw = match[1];
   const gang = gangRaw.toLowerCase();
   const nick = match[2];
-  const hits = parseInt(match[3]);
-  const headshots = parseInt(match[4]);
-  const damage = parseInt(match[5]);
+  const hits = parseInt(match[3], 10);
+  const headshots = parseInt(match[4], 10);
+  const damage = parseInt(match[5], 10);
 
   if (!playerStats[gang]) {
     console.log("Unknown gang in HIT line:", gangRaw);
@@ -164,10 +186,10 @@ function parseHitLine(line) {
   playerStats[gang][nick].headshots += headshots;
   playerStats[gang][nick].damage += damage;
 
-  console.log(`Updated stats for ${gangRaw}/${nick}:`, playerStats[gang][nick]);
+  console.log(`✅ Updated stats for ${gangRaw}/${nick}:`, playerStats[gang][nick]);
 }
 
-// შექმნის უნიკალურ HTML გვერდს თითოეული capture-სთვის
+// Create unique HTML page for each capture
 function createCapturePage(g1, g2, start, weapon) {
   const emoji1 = gangColors[g1]?.emoji || "⚔️";
   const emoji2 = gangColors[g2]?.emoji || "🛡️";
@@ -252,15 +274,14 @@ function createCapturePage(g1, g2, start, weapon) {
   const filePath = path.join(WEB_DIR, fileName);
   fs.writeFileSync(filePath, html, "utf8");
 
-  const url = `http://localhost:${WEB_PORT}/${fileName}`;
-  return url;
+  return `http://localhost:${WEB_PORT}/${fileName}`;
 }
 
-// გააგზავნის ემბედს და ბატონს დისკორდში
+// Send embed + button to Discord
 function sendEmbedAndCreateSite(g1, g2, start, weapon) {
   const channel = client.channels.cache.get(CHANNEL_ID);
   if (!channel) {
-    console.error("Channel not found. Check CHANNEL_ID.");
+    console.error("❌ Channel not found. Check CHANNEL_ID.");
     return;
   }
 
@@ -291,11 +312,11 @@ function sendEmbedAndCreateSite(g1, g2, start, weapon) {
   );
 
   channel.send({ embeds: [embed], components: [row] })
-    .then(() => console.log("Embed + site link sent."))
+    .then(() => console.log("📨 Embed + site link sent."))
     .catch(err => console.error("Send error:", err));
 }
 
-// --- LOGIN ---
+// ---------- LOGIN ----------
 client.login(DISCORD_TOKEN).catch(err => {
   console.error("Login failed:", err);
 });
