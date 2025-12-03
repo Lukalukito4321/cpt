@@ -1,5 +1,5 @@
-// cpt.js - Capture watcher + HIT stats + small web server
-// 1) Edit TOKEN / CHANNEL_ID / LOG_PATH via environment variables or .env
+// cpt.js - Capture watcher + HIT stats + small web server (HTTP API ვერსია)
+// 1) Edit TOKEN / CHANNEL_ID via environment variables ან .env
 // 2) Run:  npm install  &&  npm start
 
 const {
@@ -10,7 +10,6 @@ const {
   ButtonBuilder,
   ButtonStyle
 } = require("discord.js");
-const chokidar = require("chokidar");
 const fs = require("fs");
 const express = require("express");
 const path = require("path");
@@ -18,11 +17,10 @@ const path = require("path");
 // ---------- SETTINGS ----------
 let dotenvLoaded = false;
 try {
-  // Will silently do nothing if .env doesn't exist (Railway is fine)
   require("dotenv").config();
   dotenvLoaded = true;
 } catch (e) {
-  console.log("dotenv not found – this is fine if you use real env vars (e.g. Railway).");
+  console.log("dotenv not found – ეს ნორმალურია თუ Railway env vars იყენებ.");
 }
 
 // BOT TOKEN (MUST be set)
@@ -33,11 +31,7 @@ if (!DISCORD_TOKEN) {
 }
 
 // DISCORD CHANNEL
-const CHANNEL_ID = process.env.CHANNEL_ID || "1441330193883987999"; // change or move to env if you like
-
-// LOG PATH – override via LOG_PATH env when needed (e.g. Railway)
-const DEFAULT_LOG_PATH = "server.log";
-const LOG_PATH = process.env.LOG_PATH || DEFAULT_LOG_PATH;
+const CHANNEL_ID = process.env.CHANNEL_ID || "1441330193883987999"; // ჩაანაცვლე თუ სხვაა
 
 // Web server port
 const WEB_PORT = process.env.PORT ? Number(process.env.PORT) : 3000;
@@ -59,8 +53,10 @@ if (!fs.existsSync(WEB_DIR)) {
 
 const app = express();
 app.use(express.static(WEB_DIR));
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
-// In-memory stats
+// In-memory stats (თუ ოდესღაც HIT-ებს დაემატები)
 let playerStats = {
   ballas: {},
   marabunta: {},
@@ -84,11 +80,94 @@ app.get("/stats", (req, res) => {
   res.json(playerStats);
 });
 
-// Optional: capture meta API (start + winner etc.)
+// capture meta API (start + winner etc.)
 app.get("/capture", (req, res) => {
   res.json(currentCapture);
 });
 
+// ---------- HTTP API: /capture & /winner ----------
+
+// Helper: normalize string
+function norm(v) {
+  return (v || "").toString().trim();
+}
+
+// START CAPTURE
+// POST /capture  JSON: { gang1, gang2, start, weapon }
+// ასევე შეგიძლია GET /capture?gang1=...&gang2=...&start=...&weapon=...
+async function handleCapture(req, res) {
+  const gang1 = norm(req.body.gang1 || req.query.gang1).toLowerCase();
+  const gang2 = norm(req.body.gang2 || req.query.gang2).toLowerCase();
+  const start = norm(req.body.start || req.query.start);
+  const weapon = norm(req.body.weapon || req.query.weapon);
+
+  if (!gang1 || !gang2 || !start || !weapon) {
+    return res.status(400).json({
+      ok: false,
+      error: "Required fields: gang1, gang2, start, weapon"
+    });
+  }
+
+  currentCapture = {
+    gang1,
+    gang2,
+    start,
+    weapon,
+    winner: null,
+    fileName: null
+  };
+
+  const siteUrl = await sendEmbedAndCreateSite(gang1, gang2, start, weapon);
+
+  return res.json({
+    ok: true,
+    gang1,
+    gang2,
+    start,
+    weapon,
+    siteUrl
+  });
+}
+
+app.post("/capture", handleCapture);
+app.get("/capture-start", handleCapture); // პატარა ბონუსი ტესტისთვის ბრაუზერიდან
+
+// WINNER
+// POST /winner  JSON: { winner }
+// ან GET /winner?winner=...
+function handleWinner(req, res) {
+  const winnerRaw = norm(req.body.winner || req.query.winner);
+  const winner = winnerRaw.toLowerCase();
+
+  if (!winner) {
+    return res.status(400).json({ ok: false, error: "Required field: winner" });
+  }
+
+  if (!currentCapture || !currentCapture.gang1) {
+    return res.status(400).json({ ok: false, error: "No active capture" });
+  }
+
+  currentCapture.winner = winner;
+
+  const siteUrl = createCapturePage(
+    currentCapture.gang1,
+    currentCapture.gang2,
+    currentCapture.start,
+    currentCapture.weapon,
+    currentCapture.winner
+  );
+
+  return res.json({
+    ok: true,
+    winner,
+    siteUrl
+  });
+}
+
+app.post("/winner", handleWinner);
+app.get("/winner", handleWinner); // GET-იც მუშაობს ტესტისთვის
+
+// ---------- WEB SERVER START ----------
 app.listen(WEB_PORT, () => {
   console.log(`🌐 Web server running at http://localhost:${WEB_PORT}`);
 });
@@ -102,127 +181,13 @@ const gangColors = {
   vagos:    { emoji: "🟨", color: 0xF1C40F }
 };
 
-// ---------- DISCORD READY + LOG WATCH ----------
-client.once("ready", () => {
+// ---------- DISCORD READY ----------
+client.once("clientReady", () => {
   console.log(`🤖 Bot logged in as ${client.user.tag}`);
-
-  if (!fs.existsSync(LOG_PATH)) {
-    console.warn(`⚠ LOG_PATH does not exist: ${LOG_PATH}`);
-    console.warn("   Create the file or set LOG_PATH env var correctly.");
-  } else {
-    console.log("📄 Watching log file:", LOG_PATH);
-  }
-
-  chokidar.watch(LOG_PATH, {
-    persistent: true,
-    usePolling: true,
-    interval: 300,
-    awaitWriteFinish: {
-      stabilityThreshold: 500,
-      pollInterval: 100
-    }
-  })
-    .on("change", filePath => {
-      console.log("🔄 File changed:", filePath);
-      readLastLine(LOG_PATH, (line) => {
-        if (!line) return;
-        console.log("➡ NEW LINE:", line);
-        parseLogLine(line);
-      });
-    })
-    .on("error", err => console.error("Watcher error:", err));
 });
 
-// ---------- HELPERS ----------
-function readLastLine(filePath, callback) {
-  fs.readFile(filePath, "utf8", (err, data) => {
-    if (err) {
-      console.error("Read error:", err.message);
-      return callback(null);
-    }
-    const trimmed = data.trim();
-    if (!trimmed) return callback(null);
-    const lines = trimmed.split("\n");
-    callback(lines[lines.length - 1] || null);
-  });
-}
-
-// MAIN log parser for each new line
-function parseLogLine(line) {
-  // HIT stats
-  if (line.includes("[HIT]")) {
-    parseHitLine(line);
-    return;
-  }
-
-  // Winner line: e.g. "winner bloods"
-  if (/winner[:\s]+/i.test(line)) {
-    parseWinnerLine(line);
-    return;
-  }
-
-  // Capture line
-  if (!line.includes("[CAPTURE]")) return;
-
-  const regex = /\[CAPTURE\]\s+gang1=(.*?)\s+gang2=(.*?)\s+start=(.*?)\s+weapon=(.*)$/;
-  const m = line.match(regex);
-  if (!m) {
-    console.log("CAPTURE line didn't match expected format.");
-    return;
-  }
-
-  const gang1 = m[1].toLowerCase();
-  const gang2 = m[2].toLowerCase();
-  const start = m[3];
-  const weapon = m[4];
-
-  // Remember capture for later winner update
-  currentCapture = {
-    gang1,
-    gang2,
-    start,
-    weapon,
-    winner: null,
-    fileName: null
-  };
-
-  // Only here we send embed + create page (no new embed on winner)
-  sendEmbedAndCreateSite(gang1, gang2, start, weapon);
-}
-
-// Winner line parser
-function parseWinnerLine(line) {
-  const match = line.match(/winner[:\s]+(\w+)/i);
-  if (!match) {
-    console.log("Winner line didn't match expected format:", line);
-    return;
-  }
-
-  const winnerRaw = match[1];
-  const winner = winnerRaw.toLowerCase();
-
-  console.log(`🏁 Winner detected: ${winnerRaw}`);
-
-  if (!currentCapture || !currentCapture.gang1) {
-    console.log("⚠ Winner found but no active capture exists.");
-    return;
-  }
-
-  // Save winner
-  currentCapture.winner = winner;
-
-  // Update the HTML page ONLY (no new embed)
-  createCapturePage(
-    currentCapture.gang1,
-    currentCapture.gang2,
-    currentCapture.start,
-    currentCapture.weapon,
-    currentCapture.winner
-  );
-}
-
-// HIT line parser
-// Example: [HIT] gang=Ballas nick=AV_ASSA hits=3 headshots=1 dmg=90
+// ---------- (აი HIT parser შეინახე მომავალისთვის თუ გახდება საჭირო) ----------
+// ამ ეტაპზე არ იძახება, მაგრამ stats სტრუქტურა მზადაა მომავალში /hit API-სთვის.
 function parseHitLine(line) {
   const hitRegex = /\[HIT\]\s+gang=(.*?)\s+nick=(.*?)\s+hits=(\d+)\s+headshots=(\d+)\s+dmg=(\d+)/;
   const match = line.match(hitRegex);
@@ -254,6 +219,7 @@ function parseHitLine(line) {
   console.log(`✅ Updated stats for ${gangRaw}/${nick}:`, playerStats[gang][nick]);
 }
 
+// ---------- HTML GENERATOR ----------
 function createCapturePage(g1, g2, start, weapon, winner) {
   const emoji1 = gangColors[g1]?.emoji || "⚔️";
   const emoji2 = gangColors[g2]?.emoji || "🛡️";
@@ -282,13 +248,18 @@ function createCapturePage(g1, g2, start, weapon, winner) {
       </div>
     </header>
 
+    <div class="versus-title">
+      ${g1.toUpperCase()} vs ${g2.toUpperCase()}
+    </div>
+
     <section class="info-section">
       <div class="info-cards">
         <div class="card"><strong>Attacker</strong><br>${emoji1} ${g1.toUpperCase()}</div>
         <div class="card"><strong>Defender</strong><br>${emoji2} ${g2.toUpperCase()}</div>
         <div class="card"><strong>Start</strong><br>${start}</div>
-        <div class="card"><strong>Weapon</strong><br>${weapon}</div>
         <div class="card"><strong>Winner</strong><br>${winnerDisplay}</div>
+        <div class="card"><strong>Weapon</strong><br>${weapon}</div>
+        <div class="card card-empty"></div>
       </div>
     </section>
 
@@ -352,16 +323,15 @@ function createCapturePage(g1, g2, start, weapon, winner) {
   return `http://localhost:${WEB_PORT}/${fileName}`;
 }
 
-
 // Send embed + button to Discord
-function sendEmbedAndCreateSite(g1, g2, start, weapon) {
-  const channel = client.channels.cache.get(CHANNEL_ID);
+async function sendEmbedAndCreateSite(g1, g2, start, weapon) {
+  const channel = await client.channels.fetch(CHANNEL_ID).catch(() => null);
   if (!channel) {
     console.error("❌ Channel not found. Check CHANNEL_ID.");
-    return;
+    return null;
   }
 
-  const siteUrl = createCapturePage(g1, g2, start, weapon);
+  const siteUrl = createCapturePage(g1, g2, start, weapon, currentCapture?.winner || null);
 
   const color1 = gangColors[g1]?.color || 0x800080;
   const emoji1 = gangColors[g1]?.emoji || "⚔️";
@@ -387,9 +357,11 @@ function sendEmbedAndCreateSite(g1, g2, start, weapon) {
       .setStyle(ButtonStyle.Link)
   );
 
-  channel.send({ embeds: [embed], components: [row] })
+  await channel.send({ embeds: [embed], components: [row] })
     .then(() => console.log("📨 Embed + site link sent."))
     .catch(err => console.error("Send error:", err));
+
+  return siteUrl;
 }
 
 // ---------- LOGIN ----------
