@@ -36,7 +36,7 @@ if (!DISCORD_TOKEN) {
 const CHANNEL_ID = process.env.CHANNEL_ID || "1441330193883987999"; // change or move to env if you like
 
 // LOG PATH – override via LOG_PATH env when needed (e.g. Railway)
-const DEFAULT_LOG_PATH = "\\server.log";
+const DEFAULT_LOG_PATH = "server.log";
 const LOG_PATH = process.env.LOG_PATH || DEFAULT_LOG_PATH;
 
 // Web server port
